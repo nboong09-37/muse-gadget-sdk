@@ -15,11 +15,8 @@
  */
 
 /*
- * SpotPear ESP32-AI-1.28 v1.0, old non-legged MAX98357A + NP0557 board.
- * Reference: tomorrow56/xiaozhi-esp32, commit fed7f14,
- * main/boards/spotpear/spotpear-esp32-ai-1.28/config.h and board init.
- * 16 MB flash, 8 MB octal PSRAM, native USB Serial/JTAG.
- * No touch, I2C audio codec, MCLK or verified battery gauge.
+ * SpotPear ESP32-AI-1.28 v1.0, customized with clean INMP441 audio gain,
+ * Voice Activity Detection (Hands-free Auto Listening), and GC9A01 LCD.
  */
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -34,6 +31,7 @@
 #include "freertos/task.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "driver/i2s_std.h"
 #include "muse_audio.h"
@@ -57,6 +55,11 @@ static const char *TAG = "board";
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static muse_gpio_button_t s_talk;
+
+// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD) =====
+static volatile bool s_vad_speaking = false;
+static int s_vad_silence_chunks = 0;
+static int s_vad_active_chunks = 0;
 
 static esp_err_t init(void)
 {
@@ -163,17 +166,20 @@ static void set_brightness(int pct)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-/* The GC9A01 driver doesn't implement disp_sleep, so send SLPIN/SLPOUT
- * ourselves. GRAM is kept. */
 static void panel_sleep(bool sleep)
 {
     esp_lcd_panel_io_tx_param(s_io, sleep ? 0x10 : 0x11, NULL, 0);
-    vTaskDelay(pdMS_TO_TICKS(120));   /* settle before the next command */
+    vTaskDelay(pdMS_TO_TICKS(120));
 }
 
+// ===== HỖ TRỢ CẢ NÚT VẬT LÝ VÀ TỰ ĐỘNG PHÁT HIỆN GIỌNG NÓI =====
 static unsigned poll_buttons(void)
 {
-    return muse_gpio_button_poll(&s_talk);
+    unsigned hw = muse_gpio_button_poll(&s_talk);
+    if (s_vad_speaking) {
+        hw |= 1; // Kích hoạt nút ảo khi phát hiện người đang nói
+    }
+    return hw;
 }
 
 static void wait_buttons(int timeout_ms)
@@ -185,8 +191,8 @@ static void wait_buttons(int timeout_ms)
 static i2s_chan_handle_t s_tx, s_rx;
 static bool s_tx_on, s_rx_on;
 static spotpear_resampler_t s_resampler;
-static int s_gain_q8 = 256;
-static int32_t s_dc;
+static int s_gain_q8 = 256; // Mặc định 0 dB (gain = 1.0) cho INMP441
+static int32_t s_dc = 0;
 
 static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
 {
@@ -203,9 +209,6 @@ static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type
     return ESP_CODEC_DEV_OK;
 }
 
-/* esp_codec_dev applies software volume to Muse's 16-bit stereo samples.
- * Keep its 16 kHz interface; convert the left slot to 24 kHz / 32-bit mono
- * here, preserving the tested MAX98357A clock and slot format. */
 static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
@@ -228,14 +231,15 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
     return ESP_CODEC_DEV_OK;
 }
 
-/* NP0557 is left-aligned in a 32-bit left slot. Remove DC before software
- * gain, then present stereo frames with a silent right slot to Muse. */
+/* Thu âm Mic INMP441: Giữ âm thanh trong trẻo, không vỡ tiếng + Thuật toán VAD tự động lắng nghe */
 static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
     if (size < 0 || size % 4) return ESP_CODEC_DEV_READ_FAIL;
     int16_t *output = (int16_t *)data;
     int frames = size / 4;
+    int32_t max_amp = 0;
+
     while (frames) {
         int n = frames > 128 ? 128 : frames;
         int32_t samples[128];
@@ -245,21 +249,48 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
         for (int i = 0; i < n; ++i) {
             int32_t v = samples[i] >> 16;
             s_dc += (v * 256 - s_dc) >> 8;
-            int64_t amplified = (int64_t)(v - (s_dc >> 8)) * s_gain_q8 / 256;
-            output[2 * i] = amplified > INT16_MAX ? INT16_MAX :
-                            amplified < INT16_MIN ? INT16_MIN : (int16_t)amplified;
+            int64_t raw = (int64_t)(v - (s_dc >> 8));
+            int64_t amplified = (raw * s_gain_q8) / 256;
+            int16_t sample16 = amplified > INT16_MAX ? INT16_MAX :
+                               amplified < INT16_MIN ? INT16_MIN : (int16_t)amplified;
+            output[2 * i] = sample16;
             output[2 * i + 1] = 0;
+
+            int32_t amp = abs(sample16);
+            if (amp > max_amp) max_amp = amp;
         }
         output += n * 2;
         frames -= n;
     }
+
+    // Thuật toán VAD: Ngưỡng phát hiện tiếng nói (khoảng 1000 đối với 16-bit PCM)
+    const int32_t VAD_THRESHOLD = 1000;
+    if (max_amp > VAD_THRESHOLD) {
+        s_vad_active_chunks++;
+        s_vad_silence_chunks = 0;
+        if (s_vad_active_chunks >= 2) { // Nói liên tục ~40ms trở lên thì kích hoạt nghe
+            s_vad_speaking = true;
+        }
+    } else {
+        s_vad_active_chunks = 0;
+        if (s_vad_speaking) {
+            s_vad_silence_chunks++;
+            // Im lặng khoảng 1.0 giây thì tự động kết thúc câu và gửi đi
+            if (s_vad_silence_chunks >= 50) {
+                s_vad_speaking = false;
+                s_vad_silence_chunks = 0;
+            }
+        }
+    }
+
     return ESP_CODEC_DEV_OK;
 }
 
 static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
 {
     (void)mic;
-    db = db < 0 ? 0 : db > 60 ? 60 : db;
+    // INMP441 có độ nhạy cao: Giới hạn gain tối đa 6 dB để chống vỡ tiếng hoàn toàn
+    db = db < 0 ? 0 : db > 6 ? 6 : db;
     s_gain_q8 = (int)(256.0f * powf(10.0f, db / 20.0f));
 }
 
