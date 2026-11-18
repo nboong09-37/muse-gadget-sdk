@@ -16,7 +16,7 @@
 
 /*
  * SpotPear ESP32-AI-1.28 v1.0, customized with clean INMP441 audio gain,
- * Voice Activity Detection (Hands-free Auto Listening), and GC9A01 LCD.
+ * robust Edge-triggered Voice Activity Detection (Hands-free Auto Listening), and GC9A01 LCD.
  */
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -27,6 +27,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -56,8 +57,9 @@ static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static muse_gpio_button_t s_talk;
 
-// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD) =====
+// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD EDGE TRIGGER) =====
 static volatile bool s_vad_speaking = false;
+static bool s_vad_active = false;
 static int s_vad_silence_chunks = 0;
 static int s_vad_active_chunks = 0;
 
@@ -172,14 +174,19 @@ static void panel_sleep(bool sleep)
     vTaskDelay(pdMS_TO_TICKS(120));
 }
 
-// ===== HỖ TRỢ CẢ NÚT VẬT LÝ VÀ TỰ ĐỘNG PHÁT HIỆN GIỌNG NÓI =====
+// ===== XỬ LÝ XUNG CẠNH CHUẨN XÁC: PRESS VÀ RELEASE CHỈ GỬI 1 LẦN =====
 static unsigned poll_buttons(void)
 {
-    unsigned hw = muse_gpio_button_poll(&s_talk);
-    if (s_vad_speaking) {
-        hw |= 1; // Kích hoạt nút ảo khi phát hiện người đang nói
+    unsigned events = muse_gpio_button_poll(&s_talk);
+    if (s_vad_speaking != s_vad_active) {
+        s_vad_active = s_vad_speaking;
+        if (s_vad_active) {
+            events |= MUSE_BTN_TALK_PRESS;   // Chỉ gửi 1 xung khi bắt đầu nói
+        } else {
+            events |= MUSE_BTN_TALK_RELEASE; // Chỉ gửi 1 xung khi kết thúc nói
+        }
     }
-    return hw;
+    return events;
 }
 
 static void wait_buttons(int timeout_ms)
@@ -191,7 +198,7 @@ static void wait_buttons(int timeout_ms)
 static i2s_chan_handle_t s_tx, s_rx;
 static bool s_tx_on, s_rx_on;
 static spotpear_resampler_t s_resampler;
-static int s_gain_q8 = 256; // Mặc định 0 dB (gain = 1.0) cho INMP441
+static int s_gain_q8 = 256; // Mặc định 0 dB cho mic INMP441
 static int32_t s_dc = 0;
 
 static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
@@ -231,7 +238,7 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
     return ESP_CODEC_DEV_OK;
 }
 
-/* Thu âm Mic INMP441: Giữ âm thanh trong trẻo, không vỡ tiếng + Thuật toán VAD tự động lắng nghe */
+/* Thu âm Mic INMP441: Âm thanh trong trẻo + Tự động phát hiện nói VAD */
 static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
@@ -263,20 +270,25 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
         frames -= n;
     }
 
-    // Thuật toán VAD: Ngưỡng phát hiện tiếng nói (khoảng 1000 đối với 16-bit PCM)
-    const int32_t VAD_THRESHOLD = 1000;
+    // Bỏ qua 4 giây đầu khi vừa khởi động để tránh tiếng bíp boot kích hoạt nhầm
+    if (esp_timer_get_time() < 4000000LL) {
+        return ESP_CODEC_DEV_OK;
+    }
+
+    // Thuật toán VAD: Ngưỡng phát hiện tiếng nói người
+    const int32_t VAD_THRESHOLD = 1500;
     if (max_amp > VAD_THRESHOLD) {
         s_vad_active_chunks++;
         s_vad_silence_chunks = 0;
-        if (s_vad_active_chunks >= 2) { // Nói liên tục ~40ms trở lên thì kích hoạt nghe
+        if (s_vad_active_chunks >= 3) { // Nói ~60ms trở lên mới coi là tiếng nói
             s_vad_speaking = true;
         }
     } else {
         s_vad_active_chunks = 0;
         if (s_vad_speaking) {
             s_vad_silence_chunks++;
-            // Im lặng khoảng 1.0 giây thì tự động kết thúc câu và gửi đi
-            if (s_vad_silence_chunks >= 50) {
+            // Im lặng ~1.0 giây thì kết thúc câu và gửi lên Muse
+            if (s_vad_silence_chunks >= 40) {
                 s_vad_speaking = false;
                 s_vad_silence_chunks = 0;
             }
@@ -289,7 +301,7 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
 {
     (void)mic;
-    // INMP441 có độ nhạy cao: Giới hạn gain tối đa 6 dB để chống vỡ tiếng hoàn toàn
+    // INMP441 có độ nhạy cao: Giới hạn gain tối đa 6 dB để chống méo tiếng
     db = db < 0 ? 0 : db > 6 ? 6 : db;
     s_gain_q8 = (int)(256.0f * powf(10.0f, db / 20.0f));
 }
@@ -324,53 +336,4 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     config.gpio_cfg.ws = GPIO_NUM_4;
     config.gpio_cfg.dout = I2S_GPIO_UNUSED;
     config.gpio_cfg.din = GPIO_NUM_6;
-    err = i2s_channel_init_std_mode(s_rx, &config);
-    if (err != ESP_OK) goto fail;
-
-    static const audio_codec_data_if_t spk_if = { .enable = data_enable, .write = spk_write };
-    static const audio_codec_data_if_t mic_if = { .enable = data_enable, .read = mic_read };
-    esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .data_if = &spk_if };
-    esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .data_if = &mic_if };
-    *spk = esp_codec_dev_new(&out_cfg);
-    *mic = esp_codec_dev_new(&in_cfg);
-    if (*spk && *mic) return ESP_OK;
-    err = ESP_ERR_NO_MEM;
-fail:
-    if (*spk) esp_codec_dev_delete(*spk);
-    if (*mic) esp_codec_dev_delete(*mic);
-    *spk = NULL;
-    *mic = NULL;
-    if (s_tx) i2s_del_channel(s_tx);
-    if (s_rx) i2s_del_channel(s_rx);
-    s_tx = NULL;
-    s_rx = NULL;
-    return err;
-}
-
-static const muse_board_t s_board = {
-    .name = "SpotPear ESP32-AI-1.28 v1.0",
-    .width = LCD_RES,
-    .height = LCD_RES,
-    .round = true,
-    .diagonal_in = 1.28f,
-    .talk_button = "boot",
-    .talk_hint = { LV_ALIGN_BOTTOM_MID, 0, -12 },
-    .frame_ms = 40,
-    .avatar_px = 128,
-    .init = init,
-    .display_start = display_start,
-    .display_lock = display_lock,
-    .display_unlock = esp_lv_adapter_unlock,
-    .set_brightness = set_brightness,
-    .panel_sleep = panel_sleep,
-    .audio_init = audio_init,
-    .mic_slot = 0,
-    .set_mic_gain = set_mic_gain,
-    .poll_buttons = poll_buttons,
-    .wait_buttons = wait_buttons,
-};
-
-const muse_board_t *muse_board_get(void)
-{
-    return &s_board;
-}
+    err = i2s_channel_init_std_mode(s_rx, &
