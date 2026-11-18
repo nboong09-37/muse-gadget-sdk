@@ -336,4 +336,53 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     config.gpio_cfg.ws = GPIO_NUM_4;
     config.gpio_cfg.dout = I2S_GPIO_UNUSED;
     config.gpio_cfg.din = GPIO_NUM_6;
-    err = i2s_channel_init_std_mode(s_rx, &
+    err = i2s_channel_init_std_mode(s_rx, &config);
+    if (err != ESP_OK) goto fail;
+
+    static const audio_codec_data_if_t spk_if = { .enable = data_enable, .write = spk_write };
+    static const audio_codec_data_if_t mic_if = { .enable = data_enable, .read = mic_read };
+    esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .data_if = &spk_if };
+    esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .data_if = &mic_if };
+    *spk = esp_codec_dev_new(&out_cfg);
+    *mic = esp_codec_dev_new(&in_cfg);
+    if (*spk && *mic) return ESP_OK;
+    err = ESP_ERR_NO_MEM;
+fail:
+    if (*spk) esp_codec_dev_delete(*spk);
+    if (*mic) esp_codec_dev_delete(*mic);
+    *spk = NULL;
+    *mic = NULL;
+    if (s_tx) i2s_del_channel(s_tx);
+    if (s_rx) i2s_del_channel(s_rx);
+    s_tx = NULL;
+    s_rx = NULL;
+    return err;
+}
+
+static const muse_board_t s_board = {
+    .name = "SpotPear ESP32-AI-1.28 v1.0",
+    .width = LCD_RES,
+    .height = LCD_RES,
+    .round = true,
+    .diagonal_in = 1.28f,
+    .talk_button = "boot",
+    .talk_hint = { LV_ALIGN_BOTTOM_MID, 0, -12 },
+    .frame_ms = 40,
+    .avatar_px = 128,
+    .init = init,
+    .display_start = display_start,
+    .display_lock = display_lock,
+    .display_unlock = esp_lv_adapter_unlock,
+    .set_brightness = set_brightness,
+    .panel_sleep = panel_sleep,
+    .audio_init = audio_init,
+    .mic_slot = 0,
+    .set_mic_gain = set_mic_gain,
+    .poll_buttons = poll_buttons,
+    .wait_buttons = wait_buttons,
+};
+
+const muse_board_t *muse_board_get(void)
+{
+    return &s_board;
+}
