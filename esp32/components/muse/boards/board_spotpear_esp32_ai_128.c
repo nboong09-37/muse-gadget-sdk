@@ -44,12 +44,13 @@
 static const char *TAG = "board";
 
 #define LCD_RES 240
-#define LCD_HOST SPI3_HOST
-#define LCD_DC GPIO_NUM_10
-#define LCD_CS GPIO_NUM_13
-#define LCD_SCLK GPIO_NUM_14
-#define LCD_MOSI GPIO_NUM_17
-#define LCD_RST GPIO_NUM_18
+#define LCD_HOST SPI2_HOST
+// ===== CÁC CHÂN MÀN HÌNH THEO ĐÚNG DÂY CỦA BẠN =====
+#define LCD_DC GPIO_NUM_38
+#define LCD_CS GPIO_NUM_17
+#define LCD_SCLK GPIO_NUM_8
+#define LCD_MOSI GPIO_NUM_9
+#define LCD_RST GPIO_NUM_41
 #define LCD_BL GPIO_NUM_3
 #define DRAW_BUF_LINES 40
 
@@ -336,7 +337,6 @@ static const muse_board_t s_board = {
     .set_mic_gain = set_mic_gain,
     .poll_buttons = poll_buttons,
     .wait_buttons = wait_buttons,
-    /* No verified software power switch or battery-sense circuit. */
 };
 
 const muse_board_t *muse_board_get(void)
