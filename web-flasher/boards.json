@@ -1,5 +1,12 @@
 [
   {
+    "board": "muse-spotpear-esp32-ai-128",
+    "name": "SpotPear ESP32-AI-1.28 v1.0",
+    "usb": [
+      "303a:1001"
+    ]
+  },
+  {
     "board": "devkit",
     "name": "Espressif ESP32-C5 DevKitC-1"
   },
