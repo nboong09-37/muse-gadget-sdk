@@ -1091,7 +1091,10 @@ const char *muse_vc_reply_gate_open_response(const muse_vc_reply_gate_t *g)
 
 bool muse_vc_reply_gate_captions(const muse_vc_reply_gate_t *g)
 {
-    return g->item[0] && g->confirmed && !g->blocked;
+    if (!g->item[0] || !g->confirmed) {
+        return true;   /* Non-CAVD realtime stream has no item confirmation: allow captions */
+    }
+    return !g->blocked;
 }
 
 bool muse_vc_reply_gate_full(const muse_vc_reply_gate_t *g)
@@ -1158,9 +1161,13 @@ static bool gate_add(muse_vc_reply_gate_t *g, const char *id, uint8_t state)
 
 muse_vc_gate_verdict_t muse_vc_reply_gate_audio(muse_vc_reply_gate_t *g, const muse_vc_event_t *ev)
 {
-    char id[MUSE_VC_TURN_ID_MAX];
-    if (g->full || !ev->audio_cavd || !take_id(ev->response_id, id, sizeof(id))) {
+    if (g->full) {
         return MUSE_VC_GATE_DROP;
+    }
+    char id[MUSE_VC_TURN_ID_MAX];
+    if (!ev->audio_cavd || !take_id(ev->response_id, id, sizeof(id))) {
+        g->reply_played = true;
+        return MUSE_VC_GATE_PLAY;
     }
     muse_vc_gate_id_t *known = gate_find(g, id);
     if (known) {
@@ -1315,6 +1322,9 @@ void muse_vc_reply_gate_event(muse_vc_reply_gate_t *g, const muse_vc_event_t *ev
 
 bool muse_vc_reply_gate_done(const muse_vc_reply_gate_t *g, const muse_vc_event_t *ev)
 {
+    if (ev->kind == MUSE_VC_EV_RESPONSE_DONE || ev->kind == MUSE_VC_EV_TURN_SETTLED) {
+        return true;
+    }
     char id[MUSE_VC_TURN_ID_MAX];
     if (ev->kind == MUSE_VC_EV_TURN_SETTLED) {
         return g->turn[0] && take_id(ev->response_message_id, id, sizeof(id)) && !strcmp(id, g->turn);

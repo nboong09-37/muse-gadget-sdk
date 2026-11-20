@@ -856,6 +856,7 @@ static void on_line(void *ctx, const char *line, size_t len)
     }
     int64_t now = now_us();
     if (ev.kind == MUSE_VC_EV_AUDIO) {
+        if (!s_frames_out) ESP_LOGI(TAG, "first audio packet received (%u frames so far)", (unsigned)s_frames_out);
         play(ev, now);
         return;
     }

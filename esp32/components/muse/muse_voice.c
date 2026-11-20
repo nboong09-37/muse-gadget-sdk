@@ -1278,7 +1278,7 @@ typedef struct {
     bool ptt, held, live, hung_up, server_hold, awaiting;
     unsigned press;
     uint32_t input_epoch;
-    int64_t give_up, release_until;
+    int64_t give_up, release_until, down_us;
     size_t release_frames;
     muse_vc_gate_t gate;
 } call_ui_t;
@@ -1313,6 +1313,7 @@ static void call_input(call_ui_t *c)
             c->hung_up = true;
         } else if (c->ptt && ev.type == MUSE_PTT_DOWN) {
             finish_release(c);   /* old press closes before the new one opens */
+            c->down_us = ev.at_us;
             ++c->press;
             c->held = true;
             muse_voice_call_set_talking(true);
@@ -1321,12 +1322,18 @@ static void call_input(call_ui_t *c)
         } else if (c->ptt && ev.type == MUSE_PTT_UP && c->held) {
             c->held = false;
             muse_state_set_level(0);
-            call_view(c->live ? MUSE_VOICE_VIEW_THINKING : MUSE_VOICE_VIEW_CONNECTING);
-            if (c->server_hold) {
-                muse_voice_call_set_talking(false);
+            int64_t held_us = ev.at_us - c->down_us;
+            /* If the user quickly taps the button (< 300 ms) while in a live call and not awaiting reply, hang up */
+            if (c->press > 1 && held_us > 0 && held_us < 300000 && !c->awaiting) {
+                c->hung_up = true;
             } else {
-                c->release_until = esp_timer_get_time() + CALL_RELEASE_US;
-                c->release_frames = TAIL_FRAMES;
+                call_view(c->live ? MUSE_VOICE_VIEW_THINKING : MUSE_VOICE_VIEW_CONNECTING);
+                if (c->server_hold) {
+                    muse_voice_call_set_talking(false);
+                } else {
+                    c->release_until = esp_timer_get_time() + CALL_RELEASE_US;
+                    c->release_frames = TAIL_FRAMES;
+                }
             }
         }
     }
