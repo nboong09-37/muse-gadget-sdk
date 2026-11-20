@@ -41,9 +41,6 @@
 #include "muse_audio.h"
 #include "muse_board.h"
 #include "muse_mem.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
-#include "dummy_codec.h"
 
 static const char *TAG = "board";
 
@@ -237,7 +234,7 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
     if (size <= 0) return ESP_CODEC_DEV_WRITE_FAIL;
-    s_last_spk_time = esp_timer_get_time(); // Đánh dấu loa đang phát
+    s_last_spk_time = esp_timer_get_time(); // Đánh dấu loa đang phát để chặn echo
 
     size_t wrote = 0;
     esp_err_t err = i2s_channel_write(s_tx, data, size, &wrote, pdMS_TO_TICKS(1000));
@@ -368,7 +365,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     // Phát âm thanh khởi động nhẹ (0.15s) để kiểm tra loa MAX98357A kêu ngay khi bật nguồn
     int16_t beep[320 * 2];
     for (int i = 0; i < 320; i++) {
-        int16_t val = (int16_t)(5000.0f * sinf(2.0f * 3.14159f * 880.0f * i / MUSE_AUDIO_RATE));
+        int16_t val = (int16_t)(6000.0f * sinf(2.0f * 3.14159f * 880.0f * i / MUSE_AUDIO_RATE));
         beep[2 * i] = val;
         beep[2 * i + 1] = val;
     }
@@ -398,17 +395,12 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "mic rx enable");
     s_rx_on = true;
 
-    // 3. CODEC HANDLERS: Cho phép chỉnh âm lượng phần mềm chuẩn
-    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
-    dummy_codec_cfg_t amp_dummy = { .gpio_if = gpio_if, .pa_pin = -1 };
-    const audio_codec_if_t *amp_codec = dummy_codec_new(&amp_dummy);
-
+    // 3. CODEC DATA INTERFACES
     static const audio_codec_data_if_t spk_data = { .enable = spk_enable, .write = spk_write };
     static const audio_codec_data_if_t mic_data = { .enable = mic_enable, .read = mic_read };
 
     esp_codec_dev_cfg_t out_cfg = {
         .dev_type = ESP_CODEC_DEV_TYPE_OUT,
-        .codec_if = amp_codec,
         .data_if = &spk_data,
     };
     esp_codec_dev_cfg_t in_cfg = {
