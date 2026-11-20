@@ -26,6 +26,10 @@ CONFIG_MUSE_REALTIME_VOICE_APP_ID="hatch-web"
 CONFIG_MUSE_REALTIME_VOICE_GREETING=y
 CONFIG_MUSE_STATIC_BUFFERS_IN_PSRAM=y
 
+# Vietnamese UI language and accented Latin font
+CONFIG_MUSE_UI_LANG_VI=y
+CONFIG_MUSE_LATIN_FONT=y
+
 # Japanese captions: Unifont covers kana and the full BMP CJK ideograph range.
 CONFIG_MUSE_CJK_FONT=y
 CONFIG_MUSE_CJK_FONT_NOTO=n
