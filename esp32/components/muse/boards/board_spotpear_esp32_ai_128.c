@@ -15,11 +15,11 @@
  */
 
 /*
- * SpotPear ESP32-AI-1.28 v1.0, customized with:
- * 1. Clean INMP441 audio gain (+16 dB) for crisp Vietnamese speech recognition.
- * 2. Adaptive hands-free VAD (Voice Activity Detection).
- * 3. Echo-suppression: locks out VAD while speaker (AI voice) is playing to prevent loopback.
- * 4. GC9A01 LCD 240x240 SPI display.
+ * PetBot ESP32-S3:
+ * 1. Loa MAX98357A: I2S 16 kHz 16-bit Stereo chuẩn (BCLK 15, LRC/WS 16, DIN 7).
+ * 2. Mic INMP441: I2S 16 kHz 32-bit slot (SCK 5, WS 4, SD 6) với Gain +16 dB lọc tiếng Việt.
+ * 3. Chế độ Tự động Lắng nghe (Adaptive VAD) + Khóa chống dội loa (Echo Lockout).
+ * 4. Màn hình tròn GC9A01 240x240 SPI (DC 38, CS 17, SCLK 8, MOSI 9, RST 41).
  */
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -39,9 +39,11 @@
 #include <string.h>
 #include "driver/i2s_std.h"
 #include "muse_audio.h"
-#include "spotpear_pcm.h"
 #include "muse_board.h"
 #include "muse_mem.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "dummy_codec.h"
 
 static const char *TAG = "board";
 
@@ -60,7 +62,7 @@ static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static muse_gpio_button_t s_talk;
 
-// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD EDGE TRIGGER) VÀ CHỐNG VÒNG LẶP LOA =====
+// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD) VÀ CHỐNG VÒNG LẶP LOA =====
 static volatile bool s_vad_speaking = false;
 static bool s_vad_active = false;
 static int s_vad_silence_chunks = 0;
@@ -186,9 +188,9 @@ static unsigned poll_buttons(void)
     if (s_vad_speaking != s_vad_active) {
         s_vad_active = s_vad_speaking;
         if (s_vad_active) {
-            events |= MUSE_BTN_TALK_PRESS;   // Gửi xung khi bắt đầu phát hiện giọng người
+            events |= MUSE_BTN_TALK_PRESS;   // Bắt đầu nói -> chuyển sang LISTENING
         } else {
-            events |= MUSE_BTN_TALK_RELEASE; // Gửi xung khi kết thúc nói
+            events |= MUSE_BTN_TALK_RELEASE; // Dứt lời -> gửi lên Muse
         }
     }
     return events;
@@ -202,55 +204,50 @@ static void wait_buttons(int timeout_ms)
 
 static i2s_chan_handle_t s_tx, s_rx;
 static bool s_tx_on, s_rx_on;
-static spotpear_resampler_t s_resampler;
-// Mặc định +16 dB (q8 = 1616) để giọng người nói tự nhiên rõ ràng
+// Mặc định +16 dB (q8 = 1616) để thu âm tiếng Việt rõ ràng
 static int s_gain_q8 = 1616;
 static int32_t s_dc = 0;
 
-static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
+static int spk_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
 {
     (void)h;
-    bool output = type == ESP_CODEC_DEV_TYPE_OUT;
-    i2s_chan_handle_t channel = output ? s_tx : s_rx;
-    bool *enabled = output ? &s_tx_on : &s_rx_on;
-    if (*enabled == on) return ESP_CODEC_DEV_OK;
-    esp_err_t err = on ? i2s_channel_enable(channel) : i2s_channel_disable(channel);
+    (void)type;
+    if (s_tx_on == on) return ESP_CODEC_DEV_OK;
+    esp_err_t err = on ? i2s_channel_enable(s_tx) : i2s_channel_disable(s_tx);
     if (err != ESP_OK) return ESP_CODEC_DEV_DRV_ERR;
-    *enabled = on;
-    if (output) {
-        memset(&s_resampler, 0, sizeof(s_resampler));
-        if (on) s_last_spk_time = esp_timer_get_time();
-    } else {
-        s_dc = 0;
-    }
+    s_tx_on = on;
+    if (on) s_last_spk_time = esp_timer_get_time();
     return ESP_CODEC_DEV_OK;
 }
 
+static int mic_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
+{
+    (void)h;
+    (void)type;
+    if (s_rx_on == on) return ESP_CODEC_DEV_OK;
+    esp_err_t err = on ? i2s_channel_enable(s_rx) : i2s_channel_disable(s_rx);
+    if (err != ESP_OK) return ESP_CODEC_DEV_DRV_ERR;
+    s_rx_on = on;
+    s_dc = 0;
+    return ESP_CODEC_DEV_OK;
+}
+
+// ===== PHÁT ÂM THANH QUA LOA MAX98357A (16 kHz 16-bit STEREO CHUẨN) =====
 static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
-    if (size < 0 || size % 4) return ESP_CODEC_DEV_WRITE_FAIL;
-    s_last_spk_time = esp_timer_get_time(); // Đánh dấu thời điểm loa phát
+    if (size <= 0) return ESP_CODEC_DEV_WRITE_FAIL;
+    s_last_spk_time = esp_timer_get_time(); // Đánh dấu loa đang phát
 
-    const int16_t *input = (const int16_t *)data;
-    int frames = size / 4;
-    while (frames) {
-        int n = frames > 128 ? 128 : frames;
-        int32_t samples[192];
-        int count = 0;
-        for (int i = 0; i < n; ++i) {
-            count += spotpear_resample(&s_resampler, input[2 * i], samples + count);
-        }
-        size_t wrote = 0, bytes = count * sizeof(samples[0]);
-        if (i2s_channel_write(s_tx, samples, bytes, &wrote, 1000) != ESP_OK || wrote != bytes)
-            return ESP_CODEC_DEV_WRITE_FAIL;
-        input += n * 2;
-        frames -= n;
+    size_t wrote = 0;
+    esp_err_t err = i2s_channel_write(s_tx, data, size, &wrote, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || wrote != (size_t)size) {
+        return ESP_CODEC_DEV_WRITE_FAIL;
     }
     return ESP_CODEC_DEV_OK;
 }
 
-/* Thu âm Mic INMP441: Âm thanh trong trẻo + Tự động phát hiện nói VAD thích ứng */
+// ===== THU ÂM MIC INMP441 + TỰ ĐỘNG PHÁT HIỆN GIỌNG NÓI VAD =====
 static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
@@ -261,15 +258,15 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 
     int64_t now = esp_timer_get_time();
 
-    // CHỐNG VÒNG LẶP LOA: Nếu loa đang phát hoặc vừa phát xong trong 800ms
-    // -> Khóa VAD để không bao giờ nhận nhầm tiếng AI phát ra
+    // CHỐNG DỘI TIẾNG: Khi loa AI đang phát (hoặc trong 800ms sau đó)
+    // -> Khóa VAD để không bao giờ nhận nhầm tiếng của chính nó
     bool speaker_active = s_tx_on || ((now - s_last_spk_time) < 800000LL);
 
     while (frames) {
         int n = frames > 128 ? 128 : frames;
         int32_t samples[128];
         size_t got = 0, bytes = n * sizeof(samples[0]);
-        if (i2s_channel_read(s_rx, samples, bytes, &got, 1000) != ESP_OK || got != bytes)
+        if (i2s_channel_read(s_rx, samples, bytes, &got, pdMS_TO_TICKS(1000)) != ESP_OK || got != bytes)
             return ESP_CODEC_DEV_READ_FAIL;
         for (int i = 0; i < n; ++i) {
             int32_t v = samples[i] >> 16;
@@ -293,7 +290,7 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
         return ESP_CODEC_DEV_OK;
     }
 
-    // Nếu loa AI đang nói: ngắt VAD, xóa buffer để không thu tiếng loa
+    // Nếu loa đang nói: ngắt VAD, xóa sạch dữ liệu mic để không dính tiếng AI
     if (speaker_active) {
         s_vad_speaking = false;
         s_vad_active_chunks = 0;
@@ -302,15 +299,14 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
         return ESP_CODEC_DEV_OK;
     }
 
-    // Thuật toán VAD thích ứng môi trường:
-    // Cập nhật mức ồn nền khi đang yên lặng
+    // Thuật toán VAD thích ứng: tự đo ồn phòng khi yên lặng
     if (!s_vad_speaking) {
         s_noise_floor = (s_noise_floor * 31 + max_amp) / 32;
         if (s_noise_floor < 80) s_noise_floor = 80;
         if (s_noise_floor > 500) s_noise_floor = 500;
     }
 
-    // Ngưỡng kích hoạt giọng nói: Ồn nền + 300, giới hạn [450, 1000]
+    // Ngưỡng kích hoạt: Ồn nền + 300, nằm trong khoảng [450, 1000]
     int32_t vad_threshold = s_noise_floor + 300;
     if (vad_threshold < 450) vad_threshold = 450;
     if (vad_threshold > 1000) vad_threshold = 1000;
@@ -318,7 +314,7 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
     if (max_amp > vad_threshold) {
         s_vad_active_chunks++;
         s_vad_silence_chunks = 0;
-        if (s_vad_active_chunks >= 2) { // Phát hiện nói sau ~40ms
+        if (s_vad_active_chunks >= 2) { // Nói ~40ms trở lên là kích hoạt
             s_vad_speaking = true;
         }
     } else {
@@ -340,7 +336,6 @@ static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
 {
     (void)mic;
     // Tối ưu cho INMP441: gain từ +12 dB đến +18 dB (mặc định +16 dB)
-    // giúp thu giọng người chuẩn âm lượng, rõ tiếng Việt mà không vỡ tiếng
     db = db < 12 ? 12 : db > 18 ? 18 : db;
     s_gain_q8 = (int)(256.0f * powf(10.0f, db / 20.0f));
 }
@@ -349,16 +344,15 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
 {
     *spk = NULL;
     *mic = NULL;
-    i2s_chan_config_t tx = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_chan_config_t rx = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    tx.auto_clear = true;
-    esp_err_t err = i2s_new_channel(&tx, &s_tx, NULL);
-    if (err != ESP_OK) goto fail;
-    err = i2s_new_channel(&rx, NULL, &s_rx);
-    if (err != ESP_OK) goto fail;
-    i2s_std_config_t config = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(24000),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+
+    // 1. CẤU HÌNH LOA MAX98357A (I2S0 TX): 16 kHz 16-bit STEREO CHUẨN
+    i2s_chan_config_t tx_chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    tx_chan.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&tx_chan, &s_tx, NULL), TAG, "spk tx channel");
+
+    const i2s_std_config_t tx_std = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE), // 16000 Hz
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = GPIO_NUM_15,
@@ -367,39 +361,71 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
             .din = I2S_GPIO_UNUSED,
         },
     };
-    config.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    err = i2s_channel_init_std_mode(s_tx, &config);
-    if (err != ESP_OK) goto fail;
-    config.clk_cfg.sample_rate_hz = MUSE_AUDIO_RATE;
-    config.gpio_cfg.bclk = GPIO_NUM_5;
-    config.gpio_cfg.ws = GPIO_NUM_4;
-    config.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    config.gpio_cfg.din = GPIO_NUM_6;
-    err = i2s_channel_init_std_mode(s_rx, &config);
-    if (err != ESP_OK) goto fail;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &tx_std), TAG, "spk tx std");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "spk tx enable");
+    s_tx_on = true;
 
-    static const audio_codec_data_if_t spk_if = { .enable = data_enable, .write = spk_write };
-    static const audio_codec_data_if_t mic_if = { .enable = data_enable, .read = mic_read };
-    esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .data_if = &spk_if };
-    esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .data_if = &mic_if };
+    // Phát âm thanh khởi động nhẹ (0.15s) để kiểm tra loa MAX98357A kêu ngay khi bật nguồn
+    int16_t beep[320 * 2];
+    for (int i = 0; i < 320; i++) {
+        int16_t val = (int16_t)(5000.0f * sinf(2.0f * 3.14159f * 880.0f * i / MUSE_AUDIO_RATE));
+        beep[2 * i] = val;
+        beep[2 * i + 1] = val;
+    }
+    size_t wrote = 0;
+    for (int rep = 0; rep < 7; rep++) {
+        i2s_channel_write(s_tx, beep, sizeof(beep), &wrote, 100);
+    }
+
+    // 2. CẤU HÌNH MIC INMP441 (I2S1 RX): 16 kHz 32-bit slot
+    i2s_chan_config_t rx_chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    rx_chan.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&rx_chan, NULL, &s_rx), TAG, "mic rx channel");
+
+    i2s_std_config_t rx_std = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = GPIO_NUM_5,
+            .ws = GPIO_NUM_4,
+            .dout = I2S_GPIO_UNUSED,
+            .din = GPIO_NUM_6,
+        },
+    };
+    rx_std.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx, &rx_std), TAG, "mic rx std");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "mic rx enable");
+    s_rx_on = true;
+
+    // 3. CODEC HANDLERS: Cho phép chỉnh âm lượng phần mềm chuẩn
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
+    dummy_codec_cfg_t amp_dummy = { .gpio_if = gpio_if, .pa_pin = -1 };
+    const audio_codec_if_t *amp_codec = dummy_codec_new(&amp_dummy);
+
+    static const audio_codec_data_if_t spk_data = { .enable = spk_enable, .write = spk_write };
+    static const audio_codec_data_if_t mic_data = { .enable = mic_enable, .read = mic_read };
+
+    esp_codec_dev_cfg_t out_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = amp_codec,
+        .data_if = &spk_data,
+    };
+    esp_codec_dev_cfg_t in_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .data_if = &mic_data,
+    };
+
     *spk = esp_codec_dev_new(&out_cfg);
     *mic = esp_codec_dev_new(&in_cfg);
-    if (*spk && *mic) return ESP_OK;
-    err = ESP_ERR_NO_MEM;
-fail:
-    if (*spk) esp_codec_dev_delete(*spk);
-    if (*mic) esp_codec_dev_delete(*mic);
-    *spk = NULL;
-    *mic = NULL;
-    if (s_tx) i2s_del_channel(s_tx);
-    if (s_rx) i2s_del_channel(s_rx);
-    s_tx = NULL;
-    s_rx = NULL;
-    return err;
+    ESP_RETURN_ON_FALSE(*spk && *mic, ESP_FAIL, TAG, "codec dev creation");
+
+    ESP_LOGI(TAG, "Audio init OK: MAX98357A (I2S0 16kHz Stereo) & INMP441 (I2S1 16kHz Mono)");
+    return ESP_OK;
 }
 
 static const muse_board_t s_board = {
-    .name = "SpotPear ESP32-AI-1.28 v1.0",
+    .name = "PetBot ESP32-AI 1.28",
     .width = LCD_RES,
     .height = LCD_RES,
     .round = true,
