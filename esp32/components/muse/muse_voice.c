@@ -149,8 +149,8 @@ bool muse_voice_in_call(void) { return muse_voice_call_view() != MUSE_VOICE_VIEW
 bool muse_voice_ptt_call(void) { return muse_voice_in_call() && atomic_load(&s_ptt_call); }
 bool muse_voice_ptt_enabled(void)
 {
-#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
-    return !muse_settings_voice_notes();
+#if (CONFIG_MUSE_BOARD_M5STACK_STOPWATCH || CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128) && CONFIG_MUSE_REALTIME_VOICE
+    return true;
 #else
     return false;
 #endif
@@ -1402,7 +1402,7 @@ static void run_call(bool ptt, size_t waking_chunks)
             switch (ev) {
             case MUSE_VOICE_CALL_EV_READY:
                 c.live = true;
-                muse_state_set_caption(ptt ? "HOLD YELLOW TO TALK" : "IN A CALL - PRESS TO HANG UP");
+                muse_state_set_caption(ptt ? "HOLD TO TALK" : "IN A CALL - PRESS TO HANG UP");
                 break;
             case MUSE_VOICE_CALL_EV_HEARD:
                 muse_state_set_caption("\"%s\"", text);
@@ -1741,7 +1741,7 @@ static void voice_task(void *arg)
                 go_idle(result == NOTE_CAPTURE_ERROR ? "MICROPHONE ERROR - TRY AGAIN" : "");
                 continue;
             }
-#if CONFIG_MUSE_REALTIME_VOICE && !CONFIG_MUSE_BOARD_M5STACK_STOPWATCH
+#if CONFIG_MUSE_REALTIME_VOICE && !CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && !CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128
             /* Other boards retain tap-to-call beside holding for a note. */
             if (result == NOTE_TAP && s_press_input_epoch == muse_input_call_epoch()
                 && muse_voice_call_ready()) {
