@@ -15,8 +15,11 @@
  */
 
 /*
- * SpotPear ESP32-AI-1.28 v1.0, customized with clean INMP441 audio gain,
- * robust Edge-triggered Voice Activity Detection (Hands-free Auto Listening), and GC9A01 LCD.
+ * SpotPear ESP32-AI-1.28 v1.0, customized with:
+ * 1. Clean INMP441 audio gain (+16 dB) for crisp Vietnamese speech recognition.
+ * 2. Adaptive hands-free VAD (Voice Activity Detection).
+ * 3. Echo-suppression: locks out VAD while speaker (AI voice) is playing to prevent loopback.
+ * 4. GC9A01 LCD 240x240 SPI display.
  */
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -44,7 +47,7 @@ static const char *TAG = "board";
 
 #define LCD_RES 240
 #define LCD_HOST SPI2_HOST
-// ===== CÁC CHÂN MÀN HÌNH THEO ĐÚNG DÂY CỦA BẠN =====
+// ===== CÁC CHÂN MÀN HÌNH THEO ĐÚNG DÂY =====
 #define LCD_DC GPIO_NUM_38
 #define LCD_CS GPIO_NUM_17
 #define LCD_SCLK GPIO_NUM_8
@@ -57,11 +60,13 @@ static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static muse_gpio_button_t s_talk;
 
-// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD EDGE TRIGGER) =====
+// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD EDGE TRIGGER) VÀ CHỐNG VÒNG LẶP LOA =====
 static volatile bool s_vad_speaking = false;
 static bool s_vad_active = false;
 static int s_vad_silence_chunks = 0;
 static int s_vad_active_chunks = 0;
+static int32_t s_noise_floor = 180;
+static int64_t s_last_spk_time = 0;
 
 static esp_err_t init(void)
 {
@@ -174,16 +179,16 @@ static void panel_sleep(bool sleep)
     vTaskDelay(pdMS_TO_TICKS(120));
 }
 
-// ===== XỬ LÝ XUNG CẠNH CHUẨN XÁC: PRESS VÀ RELEASE CHỈ GỬI 1 LẦN =====
+// ===== XỬ LÝ XUNG CẠNH: PRESS VÀ RELEASE GỬI CHUẨN XÁC =====
 static unsigned poll_buttons(void)
 {
     unsigned events = muse_gpio_button_poll(&s_talk);
     if (s_vad_speaking != s_vad_active) {
         s_vad_active = s_vad_speaking;
         if (s_vad_active) {
-            events |= MUSE_BTN_TALK_PRESS;   // Chỉ gửi 1 xung khi bắt đầu nói
+            events |= MUSE_BTN_TALK_PRESS;   // Gửi xung khi bắt đầu phát hiện giọng người
         } else {
-            events |= MUSE_BTN_TALK_RELEASE; // Chỉ gửi 1 xung khi kết thúc nói
+            events |= MUSE_BTN_TALK_RELEASE; // Gửi xung khi kết thúc nói
         }
     }
     return events;
@@ -198,7 +203,8 @@ static void wait_buttons(int timeout_ms)
 static i2s_chan_handle_t s_tx, s_rx;
 static bool s_tx_on, s_rx_on;
 static spotpear_resampler_t s_resampler;
-static int s_gain_q8 = 256; // Mặc định 0 dB cho mic INMP441
+// Mặc định +16 dB (q8 = 1616) để giọng người nói tự nhiên rõ ràng
+static int s_gain_q8 = 1616;
 static int32_t s_dc = 0;
 
 static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
@@ -211,8 +217,12 @@ static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type
     esp_err_t err = on ? i2s_channel_enable(channel) : i2s_channel_disable(channel);
     if (err != ESP_OK) return ESP_CODEC_DEV_DRV_ERR;
     *enabled = on;
-    if (output) memset(&s_resampler, 0, sizeof(s_resampler));
-    else s_dc = 0;
+    if (output) {
+        memset(&s_resampler, 0, sizeof(s_resampler));
+        if (on) s_last_spk_time = esp_timer_get_time();
+    } else {
+        s_dc = 0;
+    }
     return ESP_CODEC_DEV_OK;
 }
 
@@ -220,6 +230,8 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
     if (size < 0 || size % 4) return ESP_CODEC_DEV_WRITE_FAIL;
+    s_last_spk_time = esp_timer_get_time(); // Đánh dấu thời điểm loa phát
+
     const int16_t *input = (const int16_t *)data;
     int frames = size / 4;
     while (frames) {
@@ -238,7 +250,7 @@ static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
     return ESP_CODEC_DEV_OK;
 }
 
-/* Thu âm Mic INMP441: Âm thanh trong trẻo + Tự động phát hiện nói VAD */
+/* Thu âm Mic INMP441: Âm thanh trong trẻo + Tự động phát hiện nói VAD thích ứng */
 static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
     (void)h;
@@ -246,6 +258,12 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
     int16_t *output = (int16_t *)data;
     int frames = size / 4;
     int32_t max_amp = 0;
+
+    int64_t now = esp_timer_get_time();
+
+    // CHỐNG VÒNG LẶP LOA: Nếu loa đang phát hoặc vừa phát xong trong 800ms
+    // -> Khóa VAD để không bao giờ nhận nhầm tiếng AI phát ra
+    bool speaker_active = s_tx_on || ((now - s_last_spk_time) < 800000LL);
 
     while (frames) {
         int n = frames > 128 ? 128 : frames;
@@ -270,25 +288,45 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
         frames -= n;
     }
 
-    // Bỏ qua 4 giây đầu khi vừa khởi động để tránh tiếng bíp boot kích hoạt nhầm
-    if (esp_timer_get_time() < 4000000LL) {
+    // Bỏ qua 4 giây đầu khi vừa khởi động
+    if (now < 4000000LL) {
         return ESP_CODEC_DEV_OK;
     }
 
-    // Thuật toán VAD: Ngưỡng phát hiện tiếng nói người
-    const int32_t VAD_THRESHOLD = 1500;
-    if (max_amp > VAD_THRESHOLD) {
+    // Nếu loa AI đang nói: ngắt VAD, xóa buffer để không thu tiếng loa
+    if (speaker_active) {
+        s_vad_speaking = false;
+        s_vad_active_chunks = 0;
+        s_vad_silence_chunks = 0;
+        memset(data, 0, size);
+        return ESP_CODEC_DEV_OK;
+    }
+
+    // Thuật toán VAD thích ứng môi trường:
+    // Cập nhật mức ồn nền khi đang yên lặng
+    if (!s_vad_speaking) {
+        s_noise_floor = (s_noise_floor * 31 + max_amp) / 32;
+        if (s_noise_floor < 80) s_noise_floor = 80;
+        if (s_noise_floor > 500) s_noise_floor = 500;
+    }
+
+    // Ngưỡng kích hoạt giọng nói: Ồn nền + 300, giới hạn [450, 1000]
+    int32_t vad_threshold = s_noise_floor + 300;
+    if (vad_threshold < 450) vad_threshold = 450;
+    if (vad_threshold > 1000) vad_threshold = 1000;
+
+    if (max_amp > vad_threshold) {
         s_vad_active_chunks++;
         s_vad_silence_chunks = 0;
-        if (s_vad_active_chunks >= 3) { // Nói ~60ms trở lên mới coi là tiếng nói
+        if (s_vad_active_chunks >= 2) { // Phát hiện nói sau ~40ms
             s_vad_speaking = true;
         }
     } else {
         s_vad_active_chunks = 0;
         if (s_vad_speaking) {
             s_vad_silence_chunks++;
-            // Im lặng ~1.0 giây thì kết thúc câu và gửi lên Muse
-            if (s_vad_silence_chunks >= 40) {
+            // Im lặng ~1.3 giây (65 chunks * 20ms) mới kết thúc để người nói ngắt nghỉ tự nhiên
+            if (s_vad_silence_chunks >= 65) {
                 s_vad_speaking = false;
                 s_vad_silence_chunks = 0;
             }
@@ -301,8 +339,9 @@ static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
 {
     (void)mic;
-    // INMP441 có độ nhạy cao: Giới hạn gain tối đa 6 dB để chống méo tiếng
-    db = db < 0 ? 0 : db > 6 ? 6 : db;
+    // Tối ưu cho INMP441: gain từ +12 dB đến +18 dB (mặc định +16 dB)
+    // giúp thu giọng người chuẩn âm lượng, rõ tiếng Việt mà không vỡ tiếng
+    db = db < 12 ? 12 : db > 18 ? 18 : db;
     s_gain_q8 = (int)(256.0f * powf(10.0f, db / 20.0f));
 }
 
