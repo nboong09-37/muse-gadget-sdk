@@ -16,10 +16,11 @@
 
 /*
  * PetBot ESP32-S3:
- * 1. Loa MAX98357A (I2S1 TX): BCLK 15, WS/LRC 16, DIN/DOUT 7 - 16 kHz 16-bit Stereo.
- * 2. Mic INMP441 (I2S0 RX): BCLK/SCK 5, WS 4, SD/DIN 6 - 16 kHz 32-bit slot, shift right 14 (+12 dB).
- * 3. Chế độ Tự động Lắng nghe (Adaptive VAD) + Khóa chống dội loa khi AI đang nói.
+ * 1. Loa MAX98357A (I2S1 TX): BCLK 15, WS 16, DIN/DOUT 7 - 16 kHz 16-bit Stereo.
+ * 2. Mic INMP441 (I2S0 RX): BCLK 5, WS 4, SD/DIN 6 - 16 kHz 32-bit slot, top 16 bits.
+ * 3. Nút bấm BOOT (GPIO 0): Nhấn giữ để nói, thả ra để gửi.
  * 4. Màn hình tròn GC9A01 240x240 SPI (DC 38, CS 17, SCLK 8, MOSI 9, RST 41, BL 3).
+ *    DRAW_BUF_LINES = 16 để tiết kiệm RAM nội (tránh cạn kiệt heap gây đứt kết nối).
  */
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -43,7 +44,6 @@
 #include "muse_audio.h"
 #include "muse_board.h"
 #include "muse_mem.h"
-#include "muse_state.h"
 
 static const char *TAG = "board";
 
@@ -55,7 +55,7 @@ static const char *TAG = "board";
 #define LCD_MOSI GPIO_NUM_9
 #define LCD_RST GPIO_NUM_41
 #define LCD_BL GPIO_NUM_3
-#define DRAW_BUF_LINES 40
+#define DRAW_BUF_LINES 16
 
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
@@ -63,13 +63,6 @@ static muse_gpio_button_t s_talk;
 
 static i2s_chan_handle_t s_tx;
 static i2s_chan_handle_t s_rx;
-
-// ===== BIẾN TỰ ĐỘNG LẮNG NGHE (VAD) =====
-static volatile bool s_vad_speaking = false;
-static bool s_vad_active = false;
-static int s_vad_silence_chunks = 0;
-static int s_vad_active_chunks = 0;
-static int32_t s_noise_floor = 180;
 
 static esp_err_t init(void)
 {
@@ -182,19 +175,10 @@ static void panel_sleep(bool sleep)
     vTaskDelay(pdMS_TO_TICKS(120));
 }
 
-// ===== XỬ LÝ NÚT BẤM VÀ VAD HANDS-FREE =====
+// ===== XỬ LÝ NÚT BẤM BOOT (GPIO 0) CHUẨN XÁC VÀ BỀN BỈ =====
 static unsigned poll_buttons(void)
 {
-    unsigned events = muse_gpio_button_poll(&s_talk);
-    if (s_vad_speaking != s_vad_active) {
-        s_vad_active = s_vad_speaking;
-        if (s_vad_active) {
-            events |= MUSE_BTN_TALK_PRESS;   // Bắt đầu nói -> LISTENING
-        } else {
-            events |= MUSE_BTN_TALK_RELEASE; // Dứt lời -> gửi lên server
-        }
-    }
-    return events;
+    return muse_gpio_button_poll(&s_talk);
 }
 
 static void wait_buttons(int timeout_ms)
@@ -203,18 +187,11 @@ static void wait_buttons(int timeout_ms)
     muse_gpio_buttons_wait(buttons, 1, timeout_ms);
 }
 
-// ===== THU ÂM TỪ MIC INMP441 + PHÁT HIỆN GIỌNG NÓI =====
+// ===== THU ÂM TỪ MIC INMP441 =====
 static esp_err_t mic_read(int16_t *mono, size_t frames)
 {
-    muse_mode_t mode = muse_state_mode(NULL);
-    bool is_speaking = (mode == MUSE_MODE_SPEAKING);
-
-    size_t remaining = frames;
-    int16_t *dst = mono;
-    int32_t max_amp = 0;
-
-    while (remaining) {
-        int n = remaining > 128 ? 128 : (int)remaining;
+    while (frames) {
+        int n = frames > 128 ? 128 : (int)frames;
         int32_t raw[128];
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_rx, raw, n * sizeof(int32_t), &bytes_read, pdMS_TO_TICKS(1000));
@@ -223,52 +200,12 @@ static esp_err_t mic_read(int16_t *mono, size_t frames)
         }
         int got = bytes_read / sizeof(int32_t);
         for (int i = 0; i < got; i++) {
-            // INMP441 xuất 24-bit trong 32-bit slot, shift right 14 (+12 dB) như trong gop4.ino
-            int16_t s = (int16_t)(raw[i] >> 14);
-            dst[i] = s;
-            int32_t a = abs(s);
-            if (a > max_amp) max_amp = a;
+            // INMP441: lấy 16 bit cao của slot 32-bit (muse_audio sẽ nhân thêm gain +30 dB sau đó)
+            mono[i] = (int16_t)(raw[i] >> 16);
         }
-        dst += got;
-        remaining -= got;
+        mono += got;
+        frames -= got;
     }
-
-    // Khi loa AI đang nói: khóa VAD để tránh mic tự nghe lại tiếng AI
-    if (is_speaking) {
-        s_vad_speaking = false;
-        s_vad_active_chunks = 0;
-        s_vad_silence_chunks = 0;
-        return ESP_OK;
-    }
-
-    // Đo ồn nền khi yên tĩnh
-    if (!s_vad_speaking) {
-        s_noise_floor = (s_noise_floor * 31 + max_amp) / 32;
-        if (s_noise_floor < 100) s_noise_floor = 100;
-        if (s_noise_floor > 600) s_noise_floor = 600;
-    }
-
-    int32_t threshold = s_noise_floor + 400;
-    if (threshold < 550) threshold = 550;
-    if (threshold > 1200) threshold = 1200;
-
-    if (max_amp > threshold) {
-        s_vad_active_chunks++;
-        s_vad_silence_chunks = 0;
-        if (s_vad_active_chunks >= 2) {
-            s_vad_speaking = true;
-        }
-    } else {
-        s_vad_active_chunks = 0;
-        if (s_vad_speaking) {
-            s_vad_silence_chunks++;
-            if (s_vad_silence_chunks >= 60) { // ~1.2s nghỉ nói
-                s_vad_speaking = false;
-                s_vad_silence_chunks = 0;
-            }
-        }
-    }
-
     return ESP_OK;
 }
 
@@ -317,7 +254,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &tx_std), TAG, "spk I2S init");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "spk I2S enable");
 
-    // Phát âm thanh khởi động nhẹ (0.2s) để kiểm tra loa MAX98357A kêu ngay khi bật nguồn
+    // Phát âm thanh khởi động nhẹ (0.2s) để xác nhận loa MAX98357A kêu ngay khi bật nguồn
     int16_t beep[320 * 2];
     for (int i = 0; i < 320; i++) {
         int16_t val = (int16_t)(8000.0f * sinf(2.0f * 3.14159f * 1000.0f * i / MUSE_AUDIO_RATE));
