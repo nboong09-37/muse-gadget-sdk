@@ -187,26 +187,41 @@ static void wait_buttons(int timeout_ms)
     muse_gpio_buttons_wait(buttons, 1, timeout_ms);
 }
 
-// ===== THU ÂM TỪ MIC INMP441 =====
-static esp_err_t mic_read(int16_t *mono, size_t frames)
+// ===== THU ÂM TỪ MIC INMP441 (STEREO 32-BIT SLOT, DC TRACKING & GAIN) =====
+static int s_mic_gain_q8 = 256;
+static int32_t s_mic_dc[2];
+
+static int mic_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
 {
-    while (frames) {
-        int n = frames > 128 ? 128 : (int)frames;
-        int32_t raw[128];
-        size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx, raw, n * sizeof(int32_t), &bytes_read, pdMS_TO_TICKS(1000));
-        if (err != ESP_OK) {
-            return err;
-        }
-        int got = bytes_read / sizeof(int32_t);
-        for (int i = 0; i < got; i++) {
-            // INMP441: lấy 16 bit cao của slot 32-bit (muse_audio sẽ nhân thêm gain +30 dB sau đó)
-            mono[i] = (int16_t)(raw[i] >> 16);
-        }
-        mono += got;
-        frames -= got;
+    (void)h;
+    (void)type;
+    (void)on;
+    return ESP_CODEC_DEV_OK;
+}
+
+/* A MEMS mic's slot has a small DC offset, which the gain would turn into
+ * clipping: each slot's zero level is tracked and taken off first. */
+static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
+{
+    (void)h;
+    size_t got = 0;
+    if (i2s_channel_read(s_rx, data, size, &got, pdMS_TO_TICKS(1000)) != ESP_OK || got != (size_t)size) {
+        return ESP_CODEC_DEV_READ_FAIL;
     }
-    return ESP_OK;
+    int16_t *s = (int16_t *)data;
+    for (int i = 0; i < size / 2; i++) {
+        int32_t *dc = &s_mic_dc[i & 1];
+        *dc += (s[i] * 256 - *dc) >> 8;
+        int v = (s[i] - (*dc >> 8)) * s_mic_gain_q8 >> 8;
+        s[i] = v > INT16_MAX ? INT16_MAX : v < INT16_MIN ? INT16_MIN : v;
+    }
+    return ESP_CODEC_DEV_OK;
+}
+
+static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
+{
+    (void)mic;
+    s_mic_gain_q8 = (int)(256.0f * powf(10.0f, (float)db / 20.0f));
 }
 
 // ===== KHỞI TẠO ÂM THANH: LOA MAX98357A VÀ MIC INMP441 =====
@@ -222,7 +237,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
 
     i2s_std_config_t rx_std = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = GPIO_NUM_5,
@@ -231,7 +246,10 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
             .din = GPIO_NUM_6,
         },
     };
-    rx_std.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT; // L/R nối GND = Left channel
+    /* 32-bit slots (64 clocks a frame), which an INMP441 needs. Each sample is
+     * the slot's top 16 bits. */
+    rx_std.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    rx_std.slot_cfg.ws_width = 32;
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx, &rx_std), TAG, "mic I2S init");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "mic I2S enable");
 
@@ -277,10 +295,18 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
         .data_if = tx_data,
     };
     *spk = esp_codec_dev_new(&tx_dev_cfg);
-    *mic = NULL; // Mic đọc trực tiếp qua muse_board->mic_read
 
-    ESP_LOGI(TAG, "Audio ready: MAX98357A (I2S1 Stereo) & INMP441 (I2S0 Mono)");
-    return *spk ? ESP_OK : ESP_ERR_NO_MEM;
+    // 4. CODEC DATA INTERFACE CHO MIC INMP441 (VỚI DC FILTER & SOFTWARE GAIN)
+    static const audio_codec_data_if_t mic_data = { .enable = mic_enable, .read = mic_read };
+    esp_codec_dev_cfg_t rx_dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = NULL,
+        .data_if = &mic_data,
+    };
+    *mic = esp_codec_dev_new(&rx_dev_cfg);
+
+    ESP_LOGI(TAG, "Audio ready: MAX98357A (I2S1 Stereo) & INMP441 (I2S0 Stereo slot with DC filter)");
+    return (*spk && *mic) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 static const muse_board_t s_board = {
@@ -300,8 +326,9 @@ static const muse_board_t s_board = {
     .set_brightness = set_brightness,
     .panel_sleep = panel_sleep,
     .audio_init = audio_init,
-    .mic_read = mic_read,
+    .mic_read = NULL,
     .mic_slot = 0,
+    .set_mic_gain = set_mic_gain,
     .poll_buttons = poll_buttons,
     .wait_buttons = wait_buttons,
 };

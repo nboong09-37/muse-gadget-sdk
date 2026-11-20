@@ -20,8 +20,11 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION=n
 # Store the SDK token only in the ignored build directory's sdkconfig.
 
-# Use standard hold-to-record voice notes with text replies.
-CONFIG_MUSE_REALTIME_VOICE=n
+# Live bidirectional real-time voice call with audio replies to MAX98357A speaker.
+CONFIG_MUSE_REALTIME_VOICE=y
+CONFIG_MUSE_REALTIME_VOICE_APP_ID="hatch-web"
+CONFIG_MUSE_REALTIME_VOICE_GREETING=y
+CONFIG_MUSE_STATIC_BUFFERS_IN_PSRAM=y
 
 # Japanese captions: Unifont covers kana and the full BMP CJK ideograph range.
 CONFIG_MUSE_CJK_FONT=y
