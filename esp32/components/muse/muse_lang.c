@@ -75,7 +75,7 @@ static const muse_lang_entry_t MESSAGES[] = {
     { "NOTE SENT - WAITING FOR MUSE", "Đã gửi, đang chờ Muse" },
     { "HOLD LONGER TO TALK", "Giữ nút lâu hơn để nói" },
     { "HOLD TO TALK", "Giữ để nói" },
-    { "IN A CALL - PRESS TO HANG UP", "Đang gọi - nhấn để tắt" },
+    { "IN A CALL - PRESS TO HANG UP", "Đang lắng nghe..." },
     { "RECORD A LONGER NOTE", "Hãy ghi âm lâu hơn" },
     { "MICROPHONE ERROR - TRY AGAIN", "Lỗi mic - thử lại" },
     { "SET UP MUSE FIRST", "Hãy cài đặt Muse trước" },

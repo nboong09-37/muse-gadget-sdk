@@ -1120,8 +1120,13 @@ bool muse_voice_call_init(void)
     static const muse_vc_limits_t limits = {
         .open_us = 30 * 1000000LL,      /* the ingress waits up to 120 s for a head; we don't */
         .ready_us = 40 * 1000000LL,     /* the server gives up on its backend after 25 s */
+#if CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128
+        .idle_us = 0,                    /* SpotPear: continuous listening, never hang up on idle */
+        .max_us = 0,
+#else
         .idle_us = CONFIG_MUSE_REALTIME_VOICE_IDLE_S * 1000000LL,
         .max_us = CONFIG_MUSE_REALTIME_VOICE_MAX_S * 1000000LL,
+#endif
         .end_call_us = 10 * 1000000LL,
         .drain_us = 5 * 1000000LL,
     };

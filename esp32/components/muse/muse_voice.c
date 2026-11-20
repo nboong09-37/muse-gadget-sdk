@@ -149,7 +149,7 @@ bool muse_voice_in_call(void) { return muse_voice_call_view() != MUSE_VOICE_VIEW
 bool muse_voice_ptt_call(void) { return muse_voice_in_call() && atomic_load(&s_ptt_call); }
 bool muse_voice_ptt_enabled(void)
 {
-#if (CONFIG_MUSE_BOARD_M5STACK_STOPWATCH || CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128) && CONFIG_MUSE_REALTIME_VOICE
+#if CONFIG_MUSE_BOARD_M5STACK_STOPWATCH && CONFIG_MUSE_REALTIME_VOICE
     return true;
 #else
     return false;
@@ -1309,6 +1309,12 @@ static void call_input(call_ui_t *c)
         }
         if (ev.epoch != c->input_epoch) continue;
         if (c->hung_up) continue;
+#if CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128
+        /* SpotPear PetBot: continuous hands-free call, do not hang up on BOOT button */
+        if (ev.type == MUSE_PTT_END_CALL) {
+            c->hung_up = true;
+        }
+#else
         if (ev.type == MUSE_PTT_END_CALL || (!c->ptt && ev.type == MUSE_PTT_DOWN)) {
             c->hung_up = true;
         } else if (c->ptt && ev.type == MUSE_PTT_DOWN) {
@@ -1336,6 +1342,7 @@ static void call_input(call_ui_t *c)
                 }
             }
         }
+#endif
     }
     if (atomic_load(&s_shutdown) || c->input_epoch != muse_input_call_epoch()) c->hung_up = true;
     if (c->release_until && (c->hung_up || c->server_hold ||
@@ -1662,6 +1669,15 @@ static void voice_task(void *arg)
             }
             /* The 20 ms read paces this loop. */
             idle_capture();
+#if CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128 && CONFIG_MUSE_REALTIME_VOICE
+            /* Automatically start and stay in live hands-free call: no button press needed */
+            if (muse_voice_call_ready() && !atomic_load(&s_shutdown)) {
+                s_press_input_epoch = muse_input_call_epoch();
+                run_call(false, 0);
+                pre_reset();
+                continue;
+            }
+#endif
             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
                 continue;
             }

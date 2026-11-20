@@ -466,6 +466,9 @@ static void watcher_buttons(unsigned ev)
 /* A pairing prompt wakes the screen and keeps it on; otherwise idle sleeps. */
 static void check_sleep(void)
 {
+#if CONFIG_MUSE_BOARD_SPOTPEAR_ESP32_AI_128
+    return;   /* Never sleep on SpotPear: screen always on while powered */
+#endif
     muse_ble_status_t ble;
     muse_ble_status(&ble);
     bool prompt = ble.passkey || muse_link_state() == MUSE_LINK_CONFIRM;
